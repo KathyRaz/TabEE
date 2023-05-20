@@ -1,20 +1,26 @@
 import numpy as np
 import pandas as pd
-from kstest import ks_2samp
+from FEDEx.kstest import ks_2samp
+from FEDEx.UserStudyInteractive import filter_
 from sklearn.cluster import KMeans
 from kneed import KneeLocator
 from scipy.ndimage import gaussian_filter1d
-from sklearn.metrics import pairwise_distances, calinski_harabasz_score, silhouette_score
-from scipy.spatial.distance import jensenshannon as js_div
+from sklearn.metrics import silhouette_score
 from pathos.pools import ParallelPool
 from scipy.stats import wasserstein_distance
 from sklearn.metrics import classification_report
 from sklearn.metrics import f1_score, accuracy_score
-# Path hack.
-import sys, os
+from matplotlib import pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+import bisect
 
-sys.path.append(os.path.abspath('..') + "\\FEDEx\\")
-from UserStudyInteractive import filter_
+
+def find_index(sorted_list, target):
+    index = bisect.bisect_left(sorted_list, target)
+    if index < len(sorted_list) and sorted_list[index] == target:
+        return index
+    else:
+        return -1
 
 
 def unzip_bins(zipped_vals):
@@ -88,9 +94,7 @@ def assign_multicolumn_probabilites(clustered_df, bins, column_type='result'):
     # assigning each bin its probability
     proba_vals_df.rename(columns={explain_cols[i]: binned_explain_cols[i] for i in range(len(explain_cols))},
                          inplace=True)
-    proba_vals = proba_vals_df.value_counts(normalize=True)
-
-    binned_proba = pd.DataFrame(proba_vals, columns=['VAL_PROBA']).reset_index()
+    binned_proba = proba_vals_df.value_counts(normalize=True).rename('VAL_PROBA').reset_index()
 
     # assigning each row its probability
     assigned_clustered_df = assigned_clustered_df.merge(binned_proba, on=binned_explain_cols, how='left').fillna(0.0)
@@ -222,8 +226,9 @@ def diversity_measure(current_bins, new_bins):
 
 
 def cluster_metrics(clustered_dataset, embeddings, cluster_id, suff_configurations, n_clusters,
-                    dataset_name="dataset", multicolumm_proba=True):
-    print(f'Explanation for cluster {cluster_id}:')
+                    dataset_name="dataset", multicolumm_proba=True, eval=False):
+    if eval is False:
+        print(f'Explanation for cluster {cluster_id}:')
     results, scores = filter_(clustered_dataset.drop(list(embeddings.columns), axis=1), dataset_name, "cluster",
                               "==", cluster_id, ignore={}, to_display=False)
     bins = unzip_bins(results)
@@ -255,15 +260,15 @@ def cluster_metrics(clustered_dataset, embeddings, cluster_id, suff_configuratio
 
 
 def explanation_metrics(num_clusters, dataset, embeddings, suff_configurations, dataset_name="dataset",
-                        multicolumm_proba=True, random_state=0):
+                        multicolumm_proba=True, random_state=0, eval=False):
     print(f"Evaluating {num_clusters} clusters")
     num_of_conf = len(suff_configurations)
     kmeans = KMeans(n_clusters=num_clusters, random_state=random_state)
     clusters = kmeans.fit_predict(embeddings)
     clustered_dataset = dataset.join(pd.DataFrame(data=clusters, columns=['cluster'], index=dataset.index)).join(
         embeddings)
-    total_suff = [0 for conf in suff_configurations]
-    per_cluster_suffs = [[] for conf in suff_configurations]
+    total_suff = [0 for _ in suff_configurations]
+    per_cluster_suffs = [[] for _ in suff_configurations]
     total_size = 0
     total_diversity = 0
     sizes = []
@@ -277,7 +282,8 @@ def explanation_metrics(num_clusters, dataset, embeddings, suff_configurations, 
                                                                                                      suff_configurations,
                                                                                                      num_clusters,
                                                                                                      dataset_name,
-                                                                                                     multicolumm_proba)
+                                                                                                     multicolumm_proba,
+                                                                                                     eval)
 
         for indx in range(num_of_conf):
             per_cluster_suffs[indx].append(cluster_cohort_sufficiencies[indx])
@@ -293,20 +299,20 @@ def explanation_metrics(num_clusters, dataset, embeddings, suff_configurations, 
     # mean_dist = mean_dist / N_CLUSTERS
     # mean_sim = mean_sim / N_CLUSTERS
     sil_score = silhouette_score(clustered_dataset[embeddings.columns], clustered_dataset['cluster'])
-    ch_score = calinski_harabasz_score(clustered_dataset[embeddings.columns], clustered_dataset['cluster'])
-    mean_suffs = np.asarray(total_suff) / total_size
+    # ch_score = calinski_harabasz_score(clustered_dataset[embeddings.columns], clustered_dataset['cluster'])
+    # mean_suffs = np.asarray(total_suff) / total_size
     macro_mean_suffs = [0 for _ in range(num_of_conf)]
     for indx in range(num_of_conf):
         macro_mean_suffs[indx] = np.average(per_cluster_suffs[indx])
-    mean_cluster_size = np.average(sizes)
+    # mean_cluster_size = np.average(sizes)
     results_dict = {
-        "mean_suffs": mean_suffs,
+        # "mean_suffs": mean_suffs,
         "macro_mean_suffs": macro_mean_suffs,
         "mean_kl_score": mean_kl_score,
         "sil_score": sil_score,
-        "ch_score": ch_score,
-        "mean_cluster_size": mean_cluster_size,
-        "per_cluster_suffs": per_cluster_suffs,
+        # "ch_score": ch_score,
+        # "mean_cluster_size": mean_cluster_size,
+        # "per_cluster_suffs": per_cluster_suffs,
         "total_diversity": total_diversity
     }
     return results_dict
@@ -323,7 +329,6 @@ def metrics_from_dataset(dataset, embeddings,
     hyperparams_size = len(hyperparam_range)
     knee_conf_index = 1
     num_of_conf = len(suff_configurations)
-    js = []
     total_mean_suffs_list = [[] for _ in range(num_of_conf)]
     total_macro_mean_suffs_list = [[] for _ in range(num_of_conf)]
     total_mean_cluster_sizes = []
@@ -334,21 +339,22 @@ def metrics_from_dataset(dataset, embeddings,
     total_per_cluster_suffs = [[] for _ in range(num_of_conf)]
     js = list(hyperparam_range)
 
-    pool = ParallelPool(nodes=10)
+    pool = ParallelPool(nodes=5)
+
     results_dicts = pool.map(explanation_metrics, js, [dataset] * hyperparams_size, [embeddings] * hyperparams_size,
                              [suff_configurations] * hyperparams_size, [dataset_name] * hyperparams_size,
-                             [multicolumm_proba] * hyperparams_size)
+                             [multicolumm_proba] * hyperparams_size, [0] * hyperparams_size, [True] * hyperparams_size)
 
     for result_dict in results_dicts:
         # Total definitions and aggregations
         for indx in range(num_of_conf):
-            total_mean_suffs_list[indx].append(result_dict["mean_suffs"][indx])
+            # total_mean_suffs_list[indx].append(result_dict["mean_suffs"][indx])
             total_macro_mean_suffs_list[indx].append(result_dict["macro_mean_suffs"][indx])
-            total_per_cluster_suffs[indx].append(result_dict["per_cluster_suffs"][indx])
+            # total_per_cluster_suffs[indx].append(result_dict["per_cluster_suffs"][indx])
         total_sil_scores.append(result_dict["sil_score"])
-        total_ch_scores.append(result_dict["ch_score"])
+        # total_ch_scores.append(result_dict["ch_score"])
         total_mean_kl_scores.append(result_dict["mean_kl_score"])
-        total_mean_cluster_sizes.append(result_dict["mean_cluster_size"])
+        # total_mean_cluster_sizes.append(result_dict["mean_cluster_size"])
         total_diversities.append(result_dict["total_diversity"])
 
     # if knee_conf_index:
@@ -361,13 +367,13 @@ def metrics_from_dataset(dataset, embeddings,
     #     best_param = np.round(best_param / num_of_conf)
 
     metrics = {"js": js,
-               "mean_suffs": total_mean_suffs_list,
+               # "mean_suffs": total_mean_suffs_list,
                "per_cluster_suffs": total_per_cluster_suffs,
                "macro_mean": total_macro_mean_suffs_list,
                "sil_scores": total_sil_scores,
-               "ch_scores": total_ch_scores,
+               # "ch_scores": total_ch_scores,
                "mean_kl_scores": total_mean_kl_scores,
-               "mean_cluster_sizes": total_mean_cluster_sizes,
+               # "mean_cluster_sizes": total_mean_cluster_sizes,
                "diversities": total_diversities,
                # "best_param": best_param
                }
@@ -411,7 +417,7 @@ def assign_explanation_probabilities(clustered_dataset, n_clusters, dataset_to_a
         else:
             assigned_df = assign_probabilites(clustered_dataset, bins_list[cluster_id][0])
         assigned_df[f'LIFT_{cluster_id}'] = assigned_df.apply(
-            lambda row: 0.0 if row['A_VAL_SOURCE'] == 0.0 else row['A_VAL_RESULT'] / row['A_VAL_SOURCE'], axis=1)
+            lambda row: row['A_VAL_RESULT'] / row['A_VAL_SOURCE'], axis=1)
         assigned_df = assigned_df.drop(columns=['A_VAL_RESULT', 'A_VAL_SOURCE'])
         if final_assigned_df is None:
             final_assigned_df = assigned_df
@@ -433,6 +439,11 @@ def assign_clusters_by_explanation(clustered_train, test_embeddings, test_datase
 
 def evaluate_explanation_by_predictions(train_dataset, test_dataset, train_embeddings, test_embeddings, n_clusters,
                                         metric_type='macro_f1'):
+    assert ((test_dataset is None) and (test_embeddings is None)) or (
+            (test_dataset is not None) and (test_embeddings is not None))
+    if test_dataset is None:
+        test_dataset = train_dataset
+        test_embeddings = train_embeddings
     for dataset in [train_dataset, test_dataset, train_embeddings, test_embeddings]:
         dataset.sort_index(inplace=True)
     clustered_train, kmeans_train = cluster_dataset(train_dataset, train_embeddings, n_clusters, return_model=True)
@@ -445,3 +456,31 @@ def evaluate_explanation_by_predictions(train_dataset, test_dataset, train_embed
     elif metric_type == 'accuracy':
         return accuracy_score(assigned_test['clustering_pred'], assigned_test['explanation_pred'])
     return
+
+
+def evaluate_multiple_explanations_by_predictions(train_dataset, test_dataset, train_embeddings, test_embeddings,
+                                                  n_clusters_range=range(1, 30, 1), metric_type='macro_f1'):
+    scores = []
+    scores_normalized = []
+    for j in n_clusters_range:
+        score = evaluate_explanation_by_predictions(train_dataset, test_dataset, train_embeddings, test_embeddings, j)
+        scores.append(score)
+        scores_normalized.append(normalize_by_clusters_num(score, j))
+    return scores_normalized
+
+
+def graph_from_metrics(metrics_dict):
+    plt.plot(metrics_dict['js'], metrics_dict['macro_mean'][0], label="macro mean sufficiency")
+    plt.plot(metrics_dict['js'], metrics_dict['sil_scores'], label="silhouette score")
+    plt.plot(metrics_dict['js'], metrics_dict['mean_kl_scores'], label='KL div scores')
+    plt.plot(metrics_dict['js'], MinMaxScaler().fit_transform(np.array(metrics_dict['diversities']).reshape(-1, 1)),
+             label='diversity')
+    weighted_score = MinMaxScaler().fit_transform(
+        np.array(metrics_dict['diversities']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
+        np.array(metrics_dict['mean_kl_scores']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
+        np.array(metrics_dict['sil_scores']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
+        np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1))
+    plt.plot(metrics_dict['js'], weighted_score, label='weighted scores')
+    print(metrics_dict['js'][np.argmax()])
+    plt.legend(loc='upper right')
+    plt.show()

@@ -437,8 +437,8 @@ def assign_clusters_by_explanation(clustered_train, test_embeddings, test_datase
     return assigned_test
 
 
-def evaluate_explanation_by_predictions(train_dataset, test_dataset, train_embeddings, test_embeddings, n_clusters,
-                                        metric_type='macro_f1'):
+def eval_fit_by_explanation(train_dataset, test_dataset, train_embeddings, test_embeddings, n_clusters,
+                            metric_type='macro_f1'):
     assert ((test_dataset is None) and (test_embeddings is None)) or (
             (test_dataset is not None) and (test_embeddings is not None))
     if test_dataset is None:
@@ -458,15 +458,37 @@ def evaluate_explanation_by_predictions(train_dataset, test_dataset, train_embed
     return
 
 
-def evaluate_multiple_explanations_by_predictions(train_dataset, test_dataset, train_embeddings, test_embeddings,
-                                                  n_clusters_range=range(1, 30, 1), metric_type='macro_f1'):
+def eval_range_of_fit_by_explanation(train_dataset, test_dataset, train_embeddings, test_embeddings,
+                                     n_clusters_range=range(1, 30, 1), metric_type='macro_f1'):
     scores = []
     scores_normalized = []
     for j in n_clusters_range:
-        score = evaluate_explanation_by_predictions(train_dataset, test_dataset, train_embeddings, test_embeddings, j)
+        score = eval_fit_by_explanation(train_dataset, test_dataset, train_embeddings, test_embeddings, j)
         scores.append(score)
         scores_normalized.append(normalize_by_clusters_num(score, j))
     return scores_normalized
+
+
+_ALL_METRICS = ['suff', 'div', 'sil', 'int']
+
+
+def scores_from_metrics_dict(metrics_dict, metrics_names=_ALL_METRICS):
+    scores = np.zeros(len(metrics_dict['js']))
+    if 'suff' in metrics_names:
+        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1))
+    if 'div' in metrics_names:
+        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['diversities']).reshape(-1, 1))
+    if 'sil' in metrics_names:
+        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['sil_scores']).reshape(-1, 1))
+    if 'int' in metrics_names:
+        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['mean_kl_scores']).reshape(-1, 1))
+    return scores
+
+
+def explanation_scores_from_dataset(dataset, embedding, hyperparam_range=range(3, 25, 1), remove_metrics=[]):
+    metrics = metrics_from_dataset(dataset, embedding, hyperparam_range=hyperparam_range)
+    scores = scores_from_metrics_dict(metrics, metrics_names=[met for met in _ALL_METRICS if met not in remove_metrics])
+    return scores
 
 
 def graph_from_metrics(metrics_dict):
@@ -475,12 +497,15 @@ def graph_from_metrics(metrics_dict):
     plt.plot(metrics_dict['js'], metrics_dict['mean_kl_scores'], label='KL div scores')
     plt.plot(metrics_dict['js'], MinMaxScaler().fit_transform(np.array(metrics_dict['diversities']).reshape(-1, 1)),
              label='diversity')
-    weighted_score = MinMaxScaler().fit_transform(
+    plt.plot(metrics_dict['js'], MinMaxScaler().fit_transform(
         np.array(metrics_dict['diversities']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
         np.array(metrics_dict['mean_kl_scores']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
         np.array(metrics_dict['sil_scores']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
-        np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1))
-    plt.plot(metrics_dict['js'], weighted_score, label='weighted scores')
-    print(metrics_dict['js'][np.argmax()])
+        np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1)), label='weighted scores')
+    print(metrics_dict['js'][np.argmax(MinMaxScaler().fit_transform(
+        np.array(metrics_dict['diversities']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
+        np.array(metrics_dict['mean_kl_scores']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
+        np.array(metrics_dict['sil_scores']).reshape(-1, 1)) + MinMaxScaler().fit_transform(
+        np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1)))])
     plt.legend(loc='upper right')
     plt.show()

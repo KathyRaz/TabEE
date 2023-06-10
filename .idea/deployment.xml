@@ -5,7 +5,7 @@
       <paths name="tova">
         <serverdata>
           <mappings>
-            <mapping deploy="/Explain_tab_emb" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/TabEE" local="$PROJECT_DIR$" web="/" />
             <mapping local="" />
           </mappings>
         </serverdata>

@@ -120,6 +120,30 @@ def cohort_sufficiency2(df, cluster_id, explanation_proba_col):
     return cluster_sufficiency2 * cluster_size, cluster_size
 
 
+def cohort_bayes_sufficiency(df, cluster_id, lift_col):
+    return cohort_sufficiency2(df, cluster_id, lift_col)
+
+
+def assign_explanation_probabilities(clustered_dataset, n_clusters, dataset_to_assign, multicolumn_proba=True):
+    assert n_clusters > 0
+    bins_list = get_bins_per_cluster(clustered_dataset, n_clusters)
+    final_assigned_df = None
+    for cluster_id in range(n_clusters):
+        assigned_df = assign_multicolumn_probabilites(dataset_to_assign, bins_list[cluster_id])[
+            list(dataset_to_assign.columns) + ['A_VAL_RESULT']]
+        assigned_df = assigned_df.join(
+            assign_multicolumn_probabilites(dataset_to_assign, bins_list[cluster_id], 'source')[['A_VAL_SOURCE']],
+            how='left')
+        assigned_df[f'LIFT_{cluster_id}'] = assigned_df.apply(lambda row: row['A_VAL_RESULT'] / row['A_VAL_SOURCE'],
+                                                              axis=1)
+        assigned_df = assigned_df.drop(columns=['A_VAL_RESULT', 'A_VAL_SOURCE'])
+        if final_assigned_df is None:
+            final_assigned_df = assigned_df
+        else:
+            final_assigned_df = final_assigned_df.join(assigned_df[[f'LIFT_{cluster_id}']])
+    return final_assigned_df
+
+
 def sim_from_dist(distances, conversion_type='gaussian', mean_distance=0, std_distance=4):
     if conversion_type == 'reciprocal':
         return 1 / (1 + distances)
@@ -226,15 +250,23 @@ def diversity_measure(current_bins, new_bins):
 
 
 def cluster_metrics(clustered_dataset, embeddings, cluster_id, suff_configurations, n_clusters,
-                    dataset_name="dataset", multicolumm_proba=True, eval=False):
+                    dataset_name="dataset", multicolumm_proba=True, eval=False, bayes=False):
     if eval is False:
         print(f'Explanation for cluster {cluster_id}:')
     results, scores = filter_(clustered_dataset.drop(list(embeddings.columns), axis=1), dataset_name, "cluster",
                               "==", cluster_id, ignore={}, to_display=False)
     bins = unzip_bins(results)
 
-    if multicolumm_proba:
+    if multicolumm_proba and not bayes:
         clustered_dataset_with_probas = assign_multicolumn_probabilites(clustered_dataset, bins)
+    elif multicolumm_proba and bayes:
+        clustered_dataset_with_probas = assign_multicolumn_probabilites(clustered_dataset, bins)[
+            list(clustered_dataset.columns) + ['A_VAL_RESULT']]
+        clustered_dataset_with_probas = clustered_dataset_with_probas.join(
+            assign_multicolumn_probabilites(clustered_dataset, bins, 'source')[['A_VAL_SOURCE']], how='left')
+        clustered_dataset_with_probas[f'LIFT_{cluster_id}'] = clustered_dataset_with_probas.apply(
+            lambda row: row['A_VAL_RESULT'] / row['A_VAL_SOURCE'],
+            axis=1).drop(columns=['A_VAL_RESULT', 'A_VAL_SOURCE'])
     else:
         clustered_dataset_with_probas = assign_probabilites(clustered_dataset, bins[0])
     cluster_cohort_sufficiencies = [0 for _ in suff_configurations]
@@ -249,8 +281,10 @@ def cluster_metrics(clustered_dataset, embeddings, cluster_id, suff_configuratio
                     clustered_dataset_with_probas, cluster_id, 'A_VAL_RESULT', embeddings, conf['conversion_type'])
             cluster_cohort_sufficiency /= cluster_size
         else:
-            cluster_cohort_sufficiency, cluster_size = cohort_sufficiency2(clustered_dataset_with_probas,
-                                                                           cluster_id, 'A_VAL_RESULT')
+            # cluster_cohort_sufficiency, cluster_size = cohort_sufficiency2(clustered_dataset_with_probas,
+            #                                                                cluster_id, 'A_VAL_RESULT')
+            cluster_cohort_sufficiency, cluster_size = cohort_bayes_sufficiency(clustered_dataset_with_probas,
+                                                                                cluster_id, f'LIFT_{cluster_id}')
             cluster_cohort_sufficiency /= cluster_size
             cluster_cohort_sufficiency = normalize_by_clusters_num(cluster_cohort_sufficiency, n_clusters)
         cluster_cohort_sufficiencies[indx] = cluster_cohort_sufficiency
@@ -260,13 +294,14 @@ def cluster_metrics(clustered_dataset, embeddings, cluster_id, suff_configuratio
 
 
 def explanation_metrics(num_clusters, dataset, embeddings, suff_configurations, dataset_name="dataset",
-                        multicolumm_proba=True, random_state=0, eval=False):
+                        multicolumm_proba=True, random_state=0, eval=False, bayes=False):
     print(f"Evaluating {num_clusters} clusters")
     num_of_conf = len(suff_configurations)
     kmeans = KMeans(n_clusters=num_clusters, random_state=random_state)
     clusters = kmeans.fit_predict(embeddings)
     clustered_dataset = dataset.join(pd.DataFrame(data=clusters, columns=['cluster'], index=dataset.index)).join(
         embeddings)
+    dataset_size = len(dataset)
     total_suff = [0 for _ in suff_configurations]
     per_cluster_suffs = [[] for _ in suff_configurations]
     total_size = 0
@@ -283,7 +318,8 @@ def explanation_metrics(num_clusters, dataset, embeddings, suff_configurations, 
                                                                                                      num_clusters,
                                                                                                      dataset_name,
                                                                                                      multicolumm_proba,
-                                                                                                     eval)
+                                                                                                     eval,
+                                                                                                     bayes=bayes)
 
         for indx in range(num_of_conf):
             per_cluster_suffs[indx].append(cluster_cohort_sufficiencies[indx])
@@ -320,7 +356,7 @@ def explanation_metrics(num_clusters, dataset, embeddings, suff_configurations, 
 
 def metrics_from_dataset(dataset, embeddings,
                          hyperparam_range=range(2, 50, 2), multicolumm_proba=True,
-                         dataset_name="dataset"):
+                         dataset_name="dataset", bayes=False):
     # distances = pairwise_distances(embeddings.sample(min(len(embeddings.index), 10000)))
     suff_configurations = [
         {'type': 2, 'conversion_type': 'reciprocal'}
@@ -343,7 +379,8 @@ def metrics_from_dataset(dataset, embeddings,
 
     results_dicts = pool.map(explanation_metrics, js, [dataset] * hyperparams_size, [embeddings] * hyperparams_size,
                              [suff_configurations] * hyperparams_size, [dataset_name] * hyperparams_size,
-                             [multicolumm_proba] * hyperparams_size, [0] * hyperparams_size, [True] * hyperparams_size)
+                             [multicolumm_proba] * hyperparams_size, [0] * hyperparams_size, [True] * hyperparams_size,
+                             [bayes] * hyperparams_size)
 
     for result_dict in results_dicts:
         # Total definitions and aggregations
@@ -416,8 +453,8 @@ def assign_explanation_probabilities(clustered_dataset, n_clusters, dataset_to_a
                 how='left')
         else:
             assigned_df = assign_probabilites(clustered_dataset, bins_list[cluster_id][0])
-        assigned_df[f'LIFT_{cluster_id}'] = assigned_df.apply(
-            lambda row: row['A_VAL_RESULT'] / row['A_VAL_SOURCE'], axis=1)
+        assigned_df[f'LIFT_{cluster_id}'] = assigned_df.apply(lambda row: row['A_VAL_RESULT'] / row['A_VAL_SOURCE'],
+                                                              axis=1)
         assigned_df = assigned_df.drop(columns=['A_VAL_RESULT', 'A_VAL_SOURCE'])
         if final_assigned_df is None:
             final_assigned_df = assigned_df
@@ -473,20 +510,21 @@ _ALL_METRICS = ['suff', 'div', 'sil', 'int']
 
 
 def scores_from_metrics_dict(metrics_dict, metrics_names=_ALL_METRICS):
-    scores = np.zeros(len(metrics_dict['js']))
-    if 'suff' in metrics_names:
-        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1))
+    # scores = np.zeros(len(metrics_dict['js']))
+    # if 'suff' in metrics_names:
+    scores = MinMaxScaler().fit_transform(np.array(metrics_dict['macro_mean'][0]).reshape(-1, 1))
     if 'div' in metrics_names:
-        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['diversities']).reshape(-1, 1))
+        scores = scores + MinMaxScaler().fit_transform(np.array(metrics_dict['diversities']).reshape(-1, 1))
     if 'sil' in metrics_names:
-        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['sil_scores']).reshape(-1, 1))
+        scores = scores + MinMaxScaler().fit_transform(np.array(metrics_dict['sil_scores']).reshape(-1, 1))
     if 'int' in metrics_names:
-        scores += MinMaxScaler().fit_transform(np.array(metrics_dict['mean_kl_scores']).reshape(-1, 1))
+        scores = scores + MinMaxScaler().fit_transform(np.array(metrics_dict['mean_kl_scores']).reshape(-1, 1))
     return scores
 
 
-def explanation_scores_from_dataset(dataset, embedding, hyperparam_range=range(3, 25, 1), remove_metrics=[]):
-    metrics = metrics_from_dataset(dataset, embedding, hyperparam_range=hyperparam_range)
+def explanation_scores_from_dataset(dataset, embedding, hyperparam_range=range(3, 25, 1), remove_metrics=[],
+                                    bayes=False):
+    metrics = metrics_from_dataset(dataset, embedding, hyperparam_range=hyperparam_range, bayes=bayes)
     scores = scores_from_metrics_dict(metrics, metrics_names=[met for met in _ALL_METRICS if met not in remove_metrics])
     return scores
 

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Explain_tab_emb.iml" filepath="$PROJECT_DIR$/.idea/Explain_tab_emb.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/TabEE.iml" filepath="$PROJECT_DIR$/.idea/TabEE.iml" />
     </modules>
   </component>
 </project>

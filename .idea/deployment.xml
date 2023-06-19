@@ -6,7 +6,6 @@
         <serverdata>
           <mappings>
             <mapping deploy="/TabEE" local="$PROJECT_DIR$" web="/" />
-            <mapping local="" />
           </mappings>
         </serverdata>
       </paths>

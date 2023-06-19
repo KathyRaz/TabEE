@@ -14,39 +14,46 @@ from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
 
 from constants import DATA_TYPE, DIST, BINS, CATEGORICAL_TYPE, NUMERIC_TYPE, CLUSTER, BINNED_SUFFIX, PROBA_COL
-from utils import determine_column_type, equalObs, normalize_by_clusters_num, distributions_distance, distributions_lift
+from utils import determine_column_type, equalObs, normalize_by_clusters_num, distributions_distance, \
+    distributions_lift, diversity_metric
 
 pd.set_option('mode.chained_assignment', None)
 
 
 class EmbeddingExplainer:
-
-    def __init__(self, dataset, embedding, n_clusters_range=range(2, 30, 1), random_state=None):
+    # TODO assigning an explanation for a single example using the clustering model.
+    # TODO access to top-x explanations of each cluster / overall
+    # TODO exporting Clustering module
+    def __init__(self, dataset, embedding, n_clusters_range=range(2, 30, 1), random_state=None, sil_weight=1,
+                 suff_weight=1, interest_weight=1, diversity_weight=1):
         self.dataset = dataset.copy()
         self.embedding = embedding.copy()
+        self.source_distributions = dict()
         self.n_clusters_range = list(n_clusters_range)
         self.random_state = random_state
         self.final_clustered_dataset = None
         self.clustering_model = None
         self.n_clusters = None
+        self.sil_weight = sil_weight
+        self.suff_weight = suff_weight
+        self.interest_weight = interest_weight
+        self.diversity_weight = diversity_weight
+        self.total_weight = self.sil_weight + self.suff_weight + self.interest_weight + self.diversity_weight
+        assert self.total_weight > 0.0
         self.explanation_score = None
         self.embedding_explanation = None
         self.umap_representation = None
-        self.sil_weight = 1
-        self.suff_weight = 1
-        self.interest_weight = 1
-        self.source_distributions = dict()
-        self.__bin_columns()
+        self._bin_dataset_columns()
 
-    def __bin_columns(self):
+    def _bin_dataset_columns(self):
         for column in self.dataset.columns:
             self.source_distributions[column] = dict()
             self.source_distributions[column][DATA_TYPE] = determine_column_type(self.dataset[column])
-            distribution, bins = self._bin_column(self.dataset[column], type='source')
+            distribution, bins = self._bin_single_column(self.dataset[column], type='source')
             self.source_distributions[column][DIST] = distribution
             self.source_distributions[column][BINS] = bins
 
-    def _bin_column(self, binning_column, type, num_bins=10, bins=None):
+    def _bin_single_column(self, binning_column, type, num_bins=10, bins=None):
         # type must be one of 'source', 'result'
         if self.source_distributions[binning_column.name][DATA_TYPE] == CATEGORICAL_TYPE:
             histogram = binning_column.value_counts(normalize=True).rename(f"{binning_column.name}_{type}")
@@ -57,26 +64,14 @@ class EmbeddingExplainer:
                 bins = equalObs(binning_column, num_bins)
             counts, bin_edges = np.histogram(binning_column, bins=bins)
             counts = counts / sum(counts)
-            bin_edges[len(bin_edges) - 1] = float(1.001 * bin_edges[len(bin_edges) - 1])
-            # patch to solve pd.cut problem with last bin
+            bin_edges[len(bin_edges) - 1] = bin_edges[len(bin_edges) - 1] + 1  # patch to solve pd.cut problem last bin
             return pd.Series(counts, index=bin_edges[:-1], name=f"{binning_column.name}_{type}"), bins
         else:
             raise Exception("incorrect data type")
 
-    def cluster_dataset(self):
-        silhouette_scores = []
-        for n_clusters in self.n_clusters_range:
-            clustered_dataset, kmeans_model = self.cluster_n_clusters(n_clusters, join_dataset_type='embedding')
-            sil_score = silhouette_score(clustered_dataset[self.embedding.columns], clustered_dataset[CLUSTER])
-            silhouette_scores.append(sil_score)
-        best_n = self.n_clusters_range[np.argmax(silhouette_scores)]
-        self.n_clusters = best_n
-        self.final_clustered_dataset, self.clustering_model = self.cluster_n_clusters(best_n,
-                                                                                      join_dataset_type='dataset')
-        return self.final_clustered_dataset, self.n_clusters
-
     # TODO: add MinMaxScaler or StandardScaler to the scores
     def choose_n_clusters_by_explanation(self, candidates_per_cluster=5):
+        candidates_per_cluster = min(candidates_per_cluster, len(self.dataset.columns))
         sil_scores = np.array([])
         cluster_scores = np.array([])
         explanations = []
@@ -91,7 +86,7 @@ class EmbeddingExplainer:
         # cluster_scores = StandardScaler().fit_transform(cluster_scores.reshape(-1, 1)).reshape(-1, 1)
         print(f"suff_scores={cluster_scores}")
         print(f"sil_scores={sil_scores}")
-        explanation_scores = 1 / 3 * (self.sil_weight * sil_scores + cluster_scores)
+        explanation_scores = 1 / self.total_weight * (self.sil_weight * sil_scores + cluster_scores)
         print(f"explanation_scores={explanation_scores}")
         argmax_scores = np.argmax(explanation_scores)
         best_n = self.n_clusters_range[argmax_scores]
@@ -101,15 +96,6 @@ class EmbeddingExplainer:
         self.final_clustered_dataset, self.clustering_model = self.cluster_n_clusters(best_n,
                                                                                       join_dataset_type='dataset')
         return self.final_clustered_dataset, self.n_clusters, self.explanation_score, self.embedding_explanation
-
-    def plot_explanation(self):
-        assert self.embedding_explanation is not None
-        self.plot_clustering_visualization()
-        for cluster_id in range(self.n_clusters):
-            print(f"Cluster {cluster_id} explanation:")
-            fig = self._plot_explanation_from_dist(*self.embedding_explanation[cluster_id])
-            plt.show()
-            # note here that the pattern of explanation must match the input of self.__plot_explanation_from_dist
 
     def evaluate_clustered_dataset(self, clustered_dataset, n_clusters, candidates_per_cluster=1):
         # clustered_dataset should be of type original_dataset + embeddings + cluster column
@@ -122,27 +108,28 @@ class EmbeddingExplainer:
                                                                           clustered_dataset=clustered_dataset[
                                                                               dataset_columns])
             clusters_candidates_lists.append(cluster_candidates_list)
-        # pool = ParallelPool()
-        # clusters_candidates_lists = pool.map(cluster_explanation_candidates_wrapper, [self] * n_clusters,
-        #                                      list(range(n_clusters)),
-        #                                      [candidates_per_cluster] * n_clusters,
-        #                                      [clustered_dataset[dataset_columns]] * n_clusters)
-
         all_possible_combinations = list(product(*[list(range(candidates_per_cluster))] * n_clusters))
         combinations_scores = []
         for combination in all_possible_combinations:
             # combination looks like (0,1,2,0,3,1) with length of n_clusters
             interest_list = []  # interestingness
             sufficiency_list = []
+            col_names_list = []
+            col_distributions_list = []
             for cluster_id in range(n_clusters):
-                cluster_candidate_index = combination[cluster_id]
-                _, _, interest, sufficiency = clusters_candidates_lists[cluster_id][cluster_candidate_index]
+                cluster_candidate_idx = combination[cluster_id]
+                col_name, col_dist, interest, sufficiency = clusters_candidates_lists[cluster_id][cluster_candidate_idx]
                 sufficiency_list.append(sufficiency)
                 interest_list.append(interest)
+                col_names_list.append(col_name)
+                col_distributions_list.append(col_dist)
             macro_avg_sufficiency = np.average(sufficiency_list)
             normalized_sufficiency = normalize_by_clusters_num(macro_avg_sufficiency, n_clusters)
             avg_interest = np.average(interest_list)
-            combinations_scores.append(self.suff_weight * normalized_sufficiency + self.interest_weight * avg_interest)
+            combination_diversity = diversity_metric(col_names_list, col_distributions_list)
+            combination_score = self.suff_weight * normalized_sufficiency + self.interest_weight * avg_interest + \
+                                self.diversity_weight * combination_diversity
+            combinations_scores.append(combination_score)
         argmax_score = np.argmax(combinations_scores)
         max_clusters_score = combinations_scores[argmax_score]
         best_combination = all_possible_combinations[argmax_score]
@@ -208,7 +195,7 @@ class EmbeddingExplainer:
         else:
             ind = np.arange(len(set(source_dist.keys())))
             label_tags = tuple(
-                [f"[{bins[i]}, {bins[i + 1]})" if i < len(ind) - 1 else f"[{bins[i]}, {bins[i + 1]}]" for i in ind])
+                [f"[{bins[i]}, {bins[i + 1]})" if i < len(ind) - 1 else f"[{bins[i]}, {bins[i + 1] - 1}]" for i in ind])
             ax.bar(ind + width, list(result_dist * 100), width, label="Cluster")
             ax.bar(ind, list(source_dist * 100), width, label="Dataset")
 
@@ -236,8 +223,8 @@ class EmbeddingExplainer:
         columns_distances = []
         columns_distributions = []
         for column in cluster_data.columns:
-            column_distribution, _ = self._bin_column(cluster_data[column], type='result',
-                                                      bins=self.source_distributions[column][BINS])
+            column_distribution, _ = self._bin_single_column(cluster_data[column], type='result',
+                                                             bins=self.source_distributions[column][BINS])
             column_distance, column_distribution = distributions_distance(self.source_distributions[column][DIST],
                                                                           column_distribution,
                                                                           self.source_distributions[column][DATA_TYPE])
@@ -273,3 +260,16 @@ class EmbeddingExplainer:
         plt.colorbar(boundaries=np.arange(n_clusters_to_plot + 1) - 0.5, label='cluster',
                      ticks=np.arange(n_clusters_to_plot))
         plt.show()
+
+    def plot_explanation(self):
+        assert self.embedding_explanation is not None
+        self.plot_clustering_visualization()
+        for cluster_id in range(self.n_clusters):
+            print(f"Cluster {cluster_id} explanation:")
+            fig = self._plot_explanation_from_dist(*self.embedding_explanation[cluster_id])
+            plt.show()
+            # note here that the pattern of explanation must match the input of self.__plot_explanation_from_dist
+
+    def generate_and_plot_explanation(self, candidates_per_cluster=5):
+        _ = self.choose_n_clusters_by_explanation(candidates_per_cluster=candidates_per_cluster)
+        self.plot_explanation()

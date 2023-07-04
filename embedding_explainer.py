@@ -1,7 +1,8 @@
 import warnings
 from itertools import product
-
+import time
 from tqdm import tqdm
+from pathos.pools import ParallelPool
 
 warnings.filterwarnings("ignore")
 from pathos.pools import ParallelPool
@@ -20,17 +21,34 @@ from utils import determine_column_type, equalObs, normalize_by_clusters_num, di
 pd.set_option('mode.chained_assignment', None)
 
 
+def bin_single_column(binning_column, type, data_type, num_bins=10, bins=None):
+    # data_type = self.source_distributions[binning_column.name][DATA_TYPE]
+    # type must be one of 'source', 'result'
+    if data_type == CATEGORICAL_TYPE:
+        histogram = binning_column.value_counts(normalize=True).rename(f"{binning_column.name}_{type}")
+        bins = list(histogram.index)
+        return histogram, bins
+    elif data_type == NUMERIC_TYPE:
+        if bins is None and num_bins is not None:
+            bins = equalObs(binning_column, num_bins)
+        counts, bin_edges = np.histogram(binning_column, bins=bins)
+        counts = counts / sum(counts)
+        bin_edges[len(bin_edges) - 1] = bin_edges[len(bin_edges) - 1] + 1  # patch to solve pd.cut problem last bin
+        return pd.Series(counts, index=bin_edges[:-1], name=f"{binning_column.name}_{type}"), bins
+    else:
+        raise Exception("incorrect data type")
+
+
 class EmbeddingExplainer:
     # TODO assigning an explanation for a single example using the clustering model.
-    # TODO access to top-x explanations of each cluster / overall
     # TODO exporting Clustering module
-    def __init__(self, dataset, embedding, n_clusters_range=range(2, 30, 1), random_state=None, sil_weight=1,
-                 suff_weight=1, interest_weight=1, diversity_weight=1):
+    def __init__(self, dataset, embedding, n_clusters_range=range(2, 20, 1), random_state=None, sil_weight=1,
+                 suff_weight=1, interest_weight=1, diversity_weight=0.0, explanation_score_type='best'):
         self.dataset = dataset.copy()
         self.embedding = embedding.copy()
         self.source_distributions = dict()
         self.n_clusters_range = list(n_clusters_range)
-        self.random_state = random_state
+        self.random_state = random_state if random_state is not None else int(np.random.randint(0, 1e8))
         self.final_clustered_dataset = None
         self.clustering_model = None
         self.n_clusters = None
@@ -43,33 +61,13 @@ class EmbeddingExplainer:
         self.explanation_score = None
         self.embedding_explanation = None
         self.umap_representation = None
+        self.explanation_score_type = explanation_score_type
         self._bin_dataset_columns()
 
-    def _bin_dataset_columns(self):
-        for column in self.dataset.columns:
-            self.source_distributions[column] = dict()
-            self.source_distributions[column][DATA_TYPE] = determine_column_type(self.dataset[column])
-            distribution, bins = self._bin_single_column(self.dataset[column], type='source')
-            self.source_distributions[column][DIST] = distribution
-            self.source_distributions[column][BINS] = bins
+    def generate_and_plot_explanation(self, candidates_per_cluster=5):
+        _ = self.choose_n_clusters_by_explanation(candidates_per_cluster=candidates_per_cluster)
+        self.plot_explanation()
 
-    def _bin_single_column(self, binning_column, type, num_bins=10, bins=None):
-        # type must be one of 'source', 'result'
-        if self.source_distributions[binning_column.name][DATA_TYPE] == CATEGORICAL_TYPE:
-            histogram = binning_column.value_counts(normalize=True).rename(f"{binning_column.name}_{type}")
-            bins = list(histogram.index)
-            return histogram, bins
-        elif self.source_distributions[binning_column.name][DATA_TYPE] == NUMERIC_TYPE:
-            if bins is None and num_bins is not None:
-                bins = equalObs(binning_column, num_bins)
-            counts, bin_edges = np.histogram(binning_column, bins=bins)
-            counts = counts / sum(counts)
-            bin_edges[len(bin_edges) - 1] = bin_edges[len(bin_edges) - 1] + 1  # patch to solve pd.cut problem last bin
-            return pd.Series(counts, index=bin_edges[:-1], name=f"{binning_column.name}_{type}"), bins
-        else:
-            raise Exception("incorrect data type")
-
-    # TODO: add MinMaxScaler or StandardScaler to the scores
     def choose_n_clusters_by_explanation(self, candidates_per_cluster=5):
         candidates_per_cluster = min(candidates_per_cluster, len(self.dataset.columns))
         sil_scores = np.array([])
@@ -82,22 +80,39 @@ class EmbeddingExplainer:
             sil_scores = np.append(sil_scores, sil_score)
             cluster_scores = np.append(cluster_scores, mean_clusters_score)
             explanations.append(explanation)
-        # sil_scores = StandardScaler().fit_transform(sil_scores.reshape(-1, 1)).reshape(-1, 1)
-        # cluster_scores = StandardScaler().fit_transform(cluster_scores.reshape(-1, 1)).reshape(-1, 1)
-        print(f"suff_scores={cluster_scores}")
-        print(f"sil_scores={sil_scores}")
-        explanation_scores = 1 / self.total_weight * (self.sil_weight * sil_scores + cluster_scores)
-        print(f"explanation_scores={explanation_scores}")
-        argmax_scores = np.argmax(explanation_scores)
+            del clustered_dataset
+        if self.explanation_score_type == 'best':
+            argmax_scores = np.argmax(cluster_scores)
+        elif self.explanation_score_type == 'median':
+            argmax_scores = np.argsort(cluster_scores)[len(cluster_scores) // 2]
+        elif self.explanation_score_type == 'worst':
+            argmax_scores = np.argsort(cluster_scores)[0]
         best_n = self.n_clusters_range[argmax_scores]
         self.n_clusters = best_n
-        self.explanation_score = explanation_scores[argmax_scores]
+        self.explanation_score = cluster_scores[argmax_scores]
         self.embedding_explanation = explanations[argmax_scores]
         self.final_clustered_dataset, self.clustering_model = self.cluster_n_clusters(best_n,
                                                                                       join_dataset_type='dataset')
         return self.final_clustered_dataset, self.n_clusters, self.explanation_score, self.embedding_explanation
 
-    def evaluate_clustered_dataset(self, clustered_dataset, n_clusters, candidates_per_cluster=1):
+    def plot_explanation(self):
+        assert self.embedding_explanation is not None
+        self.plot_clustering_visualization()
+        for cluster_id in range(self.n_clusters):
+            self._plot_explanation_from_dist(*self.embedding_explanation[cluster_id], cluster_id)
+            plt.show()
+            # note here that the pattern of explanation must match the input of self.__plot_explanation_from_dist
+
+    def _bin_dataset_columns(self):
+        for column in self.dataset.columns:
+            self.source_distributions[column] = dict()
+            self.source_distributions[column][DATA_TYPE] = determine_column_type(self.dataset[column])
+            distribution, bins = bin_single_column(self.dataset[column], type='source',
+                                                   data_type=self.source_distributions[column][DATA_TYPE])
+            self.source_distributions[column][DIST] = distribution
+            self.source_distributions[column][BINS] = bins
+
+    def evaluate_clustered_dataset(self, clustered_dataset, n_clusters, candidates_per_cluster=5):
         # clustered_dataset should be of type original_dataset + embeddings + cluster column
         sil_score = silhouette_score(clustered_dataset[self.embedding.columns], clustered_dataset[CLUSTER])
         clusters_candidates_lists = []
@@ -109,6 +124,8 @@ class EmbeddingExplainer:
                                                                               dataset_columns])
             clusters_candidates_lists.append(cluster_candidates_list)
         all_possible_combinations = list(product(*[list(range(candidates_per_cluster))] * n_clusters))
+        num_combinations = len(all_possible_combinations)
+
         combinations_scores = []
         for combination in all_possible_combinations:
             # combination looks like (0,1,2,0,3,1) with length of n_clusters
@@ -126,11 +143,22 @@ class EmbeddingExplainer:
             macro_avg_sufficiency = np.average(sufficiency_list)
             normalized_sufficiency = normalize_by_clusters_num(macro_avg_sufficiency, n_clusters)
             avg_interest = np.average(interest_list)
-            combination_diversity = diversity_metric(col_names_list, col_distributions_list)
-            combination_score = self.suff_weight * normalized_sufficiency + self.interest_weight * avg_interest + \
-                                self.diversity_weight * combination_diversity
+            if self.diversity_weight > 0.0:
+                combination_diversity = diversity_metric(col_names_list, col_distributions_list)
+            else:
+                combination_diversity = 0.0
+            combination_score = 1 / self.total_weight * (self.sil_weight * sil_score +
+                                                         self.suff_weight * normalized_sufficiency +
+                                                         self.interest_weight * avg_interest +
+                                                         self.diversity_weight * combination_diversity)
             combinations_scores.append(combination_score)
-        argmax_score = np.argmax(combinations_scores)
+
+        if self.explanation_score_type == 'best':
+            argmax_score = np.argmax(combinations_scores)
+        elif self.explanation_score_type == 'median':
+            argmax_score = np.argsort(combinations_scores)[len(combinations_scores) // 2]
+        elif self.explanation_score_type == 'worst':
+            argmax_score = np.argsort(combinations_scores)[0]
         max_clusters_score = combinations_scores[argmax_score]
         best_combination = all_possible_combinations[argmax_score]
         best_explanation = [(clusters_candidates_lists[cluster_id][best_combination[cluster_id]][0],
@@ -181,7 +209,7 @@ class EmbeddingExplainer:
 
     # TODO add to valid latex
     # TODO cut max values in categorical depending on importance
-    def _plot_explanation_from_dist(self, column_name, result_dist):
+    def _plot_explanation_from_dist(self, column_name, result_dist, cluster_id):
         source_dist = self.source_distributions[column_name][DIST]
         bins = self.source_distributions[column_name][BINS]
         fig, ax = plt.subplots()
@@ -190,13 +218,13 @@ class EmbeddingExplainer:
         if self.source_distributions[column_name][DATA_TYPE] == CATEGORICAL_TYPE:
             label_tags = list(self.source_distributions[column_name][DIST].index)[:20]
             ind = np.arange(len(label_tags))
-            ax.bar(ind + width, list(result_dist.loc[label_tags] * 100), width, label="Cluster")
+            ax.bar(ind + width, list(result_dist.loc[label_tags] * 100), width, label=f"Cluster {cluster_id}")
             ax.bar(ind, list(source_dist.loc[label_tags] * 100), width, label="Dataset")
         else:
             ind = np.arange(len(set(source_dist.keys())))
             label_tags = tuple(
                 [f"[{bins[i]}, {bins[i + 1]})" if i < len(ind) - 1 else f"[{bins[i]}, {bins[i + 1] - 1}]" for i in ind])
-            ax.bar(ind + width, list(result_dist * 100), width, label="Cluster")
+            ax.bar(ind + width, list(result_dist * 100), width, label=f"Cluster {cluster_id}")
             ax.bar(ind, list(source_dist * 100), width, label="Dataset")
 
         ax.set_xticks(ind + width / 2)
@@ -207,13 +235,13 @@ class EmbeddingExplainer:
         plt.ylabel("frequency (%)", fontsize=16)
 
         ax.set_title(
-            label=f"See that the column {column_name} presents a significant change in distribution.\n",
+            label=f"Cluster {cluster_id} Explanation\nThe column `{column_name}` is represented significantly differently in the cluster.\n",
             loc='center', wrap=True)
         fig = plt.gcf()
         return fig
 
     def cluster_explanation_candidates(self, cluster_id, num_candidates=1, clustered_dataset=None):
-        # if clustered_dataset is None, then the function accesses self.final_clustered_dataset
+        # if clustered_dataset is None, the function accesses self.final_clustered_dataset
         assert self.final_clustered_dataset is not None or clustered_dataset is not None
         if clustered_dataset is not None:
             cluster_data = self.dataset[clustered_dataset[CLUSTER] == cluster_id]
@@ -222,12 +250,15 @@ class EmbeddingExplainer:
             cluster_data = self.dataset[self.final_clustered_dataset[CLUSTER] == cluster_id]
         columns_distances = []
         columns_distributions = []
+
         for column in cluster_data.columns:
-            column_distribution, _ = self._bin_single_column(cluster_data[column], type='result',
-                                                             bins=self.source_distributions[column][BINS])
+            column_distribution, _ = bin_single_column(cluster_data[column], type='result',
+                                                       data_type=self.source_distributions[column][DATA_TYPE],
+                                                       bins=self.source_distributions[column][BINS])
             column_distance, column_distribution = distributions_distance(self.source_distributions[column][DIST],
                                                                           column_distribution,
-                                                                          self.source_distributions[column][DATA_TYPE])
+                                                                          self.source_distributions[column][
+                                                                              DATA_TYPE])
             # above, column_distribution is returned again so it contains also empty values that appear in source column
             columns_distances.append(column_distance)
             columns_distributions.append(column_distribution)
@@ -240,7 +271,8 @@ class EmbeddingExplainer:
 
         top_sufficiencies = []
         for candidate_index in range(num_candidates):
-            sufficiency = self.evaluate_cluster_sufficiency(clustered_dataset, cluster_id, top_columns[candidate_index],
+            sufficiency = self.evaluate_cluster_sufficiency(clustered_dataset, cluster_id,
+                                                            top_columns[candidate_index],
                                                             top_distributions[candidate_index])
             top_sufficiencies.append(sufficiency)
         return list(zip(top_columns, top_distributions, top_distances, top_sufficiencies))
@@ -260,16 +292,3 @@ class EmbeddingExplainer:
         plt.colorbar(boundaries=np.arange(n_clusters_to_plot + 1) - 0.5, label='cluster',
                      ticks=np.arange(n_clusters_to_plot))
         plt.show()
-
-    def plot_explanation(self):
-        assert self.embedding_explanation is not None
-        self.plot_clustering_visualization()
-        for cluster_id in range(self.n_clusters):
-            print(f"Cluster {cluster_id} explanation:")
-            fig = self._plot_explanation_from_dist(*self.embedding_explanation[cluster_id])
-            plt.show()
-            # note here that the pattern of explanation must match the input of self.__plot_explanation_from_dist
-
-    def generate_and_plot_explanation(self, candidates_per_cluster=5):
-        _ = self.choose_n_clusters_by_explanation(candidates_per_cluster=candidates_per_cluster)
-        self.plot_explanation()

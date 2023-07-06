@@ -5,7 +5,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 from embedding_explainer import EmbeddingExplainer
 import os
-import multiprocessing as mp
 from pathos.pp import ParallelPool
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -50,7 +49,7 @@ def create_comparison_dataframe(dataset, features_dataset, embeddings, embedding
         shap_values = shap_values_from_explainer(shap_explainer, features_dataset)
     else:
         features_dataset_split = split_dataframe(features_dataset)
-        with ParallelPool(nodes=n_jobs) as pool:
+        with ParallelPool(nodes=n_jobs, cpus=4) as pool:
             result = pool.map(shap_values_from_explainer, [shap_explainer] * n_jobs, features_dataset_split)
         shap_values = np.concatenate(result)
     del shap_explainer
@@ -100,7 +99,7 @@ if __name__ == '__main__':
     spotify_dataset = spotify_dataset.drop(columns=['genre'])
     spotify_test = pd.read_csv(_DATASETS_PATH_FORMAT.format(dataset_name='spotify_userstudy_dataset_test'),
                                index_col='Unnamed: 0')
-    spotify_sample = spotify_test.sample(1000, random_state=3)
+    spotify_sample = spotify_test.sample(1000, random_state=6)
 
     spotify_test_tabnet = pd.read_csv(
         _EMBEDDINGS_PATH_FORMAT.format(dataset_name='spotify_userstudy', embedding_name='tabnet_test'),
@@ -164,27 +163,29 @@ if __name__ == '__main__':
     # print(f"acc_spotify_tabnet_median: {spotify_tabnet_median_accuracies}")
     # print(f"acc_spotify_tabnet_worst: {spotify_tabnet_worst_accuracies}")
 
-    #
-    # covtype_dataset = pd.read_csv(_DATASETS_PATH_FORMAT.format(dataset_name='covtype_categorical'))
-    # covtype_test = pd.read_csv(_DATASETS_PATH_FORMAT.format(dataset_name='covtype_userstudy_dataset_test'),
-    #                            index_col='Unnamed: 0')
-    #
-    # covtype_test_tabnet = pd.read_csv(
-    #     _EMBEDDINGS_PATH_FORMAT.format(dataset_name='covtype_userstudy', embedding_name='tabnet_test'),
-    #     index_col='Unnamed: 0')
-    # covtype_test_transtab = pd.read_csv(
-    #     _EMBEDDINGS_PATH_FORMAT.format(dataset_name='covtype_userstudy', embedding_name='transtab_test'),
-    #     index_col='Unnamed: 0')
-    # covtype_test_vime = pd.read_csv(
-    #     _EMBEDDINGS_PATH_FORMAT.format(dataset_name='covtype_userstudy', embedding_name='vime_test'),
-    #     index_col='Unnamed: 0')
-    #
-    # covtype_sample = covtype_test.sample(10000, random_state=3)
-    #
-    # with open('/specific/disk1/home/ronycopul/Projects/TabEE/user_study_vars/covtype_vime_classifier.pkl', 'rb') as f:
-    #     covtype_vime_classifier = pickle.load(f)
-    #
-    # covtype_dataset = covtype_dataset.drop(columns=['Cover_Type'])
+    covtype_dataset = pd.read_csv(_DATASETS_PATH_FORMAT.format(dataset_name='covtype_categorical'))
+    covtype_test = pd.read_csv(_DATASETS_PATH_FORMAT.format(dataset_name='covtype_userstudy_dataset_test'),
+                               index_col='Unnamed: 0')
+
+    covtype_test_tabnet = pd.read_csv(
+        _EMBEDDINGS_PATH_FORMAT.format(dataset_name='covtype_userstudy', embedding_name='tabnet_test'),
+        index_col='Unnamed: 0')
+    covtype_test_transtab = pd.read_csv(
+        _EMBEDDINGS_PATH_FORMAT.format(dataset_name='covtype_userstudy', embedding_name='transtab_test'),
+        index_col='Unnamed: 0')
+    covtype_test_vime = pd.read_csv(
+        _EMBEDDINGS_PATH_FORMAT.format(dataset_name='covtype_userstudy', embedding_name='vime_test'),
+        index_col='Unnamed: 0')
+
+    covtype_sample = covtype_test.sample(1000, random_state=6)
+
+    with open('/specific/disk1/home/ronycopul/Projects/TabEE/user_study_vars/covtype_vime_classifier.pkl', 'rb') as f:
+        covtype_vime_classifier = pickle.load(f)
+
+    with open('/specific/disk1/home/ronycopul/Projects/TabEE/user_study_vars/covtype_tabnet_classifier.pkl', 'rb') as f:
+        covtype_tabnet_classifier = pickle.load(f)
+
+    covtype_dataset = covtype_dataset.drop(columns=['Cover_Type'])
     # covtype_vime_worst_accuracies = create_comparison_dataframe(covtype_dataset.loc[covtype_sample.index],
     #                                                             covtype_sample,
     #                                                             covtype_test_vime.loc[covtype_sample.index],
@@ -192,13 +193,13 @@ if __name__ == '__main__':
     #                                                             ['Wilderness_Area', 'Soil_Type'],
     #                                                             n_jobs=50,
     #                                                             score_type='worst')
-    # covtype_vime_best_accuracies = create_comparison_dataframe(covtype_dataset.loc[covtype_sample.index],
-    #                                                            covtype_sample,
-    #                                                            covtype_test_vime.loc[covtype_sample.index],
-    #                                                            covtype_vime_classifier,
-    #                                                            ['Wilderness_Area', 'Soil_Type'],
-    #                                                            n_jobs=50,
-    #                                                            score_type='best')
+    covtype_vime_best_accuracies = create_comparison_dataframe(covtype_dataset.loc[covtype_sample.index],
+                                                               covtype_sample,
+                                                               covtype_test_vime.loc[covtype_sample.index],
+                                                               covtype_vime_classifier,
+                                                               ['Wilderness_Area', 'Soil_Type'],
+                                                               n_jobs=10,
+                                                               score_type='best')
     # covtype_vime_median_accuracies = create_comparison_dataframe(covtype_dataset.loc[covtype_sample.index],
     #                                                              covtype_sample,
     #                                                              covtype_test_vime.loc[covtype_sample.index],
@@ -206,11 +207,21 @@ if __name__ == '__main__':
     #                                                              ['Wilderness_Area', 'Soil_Type'],
     #                                                              n_jobs=50,
     #                                                              score_type='median')
-    # del covtype_vime_classifier
-    #
-    # print(f"acc_covtype_vime_best: {covtype_vime_best_accuracies}")
+    del covtype_vime_classifier
+
+    covtype_tabnet_best_accuracies = create_comparison_dataframe(covtype_dataset.loc[covtype_sample.index],
+                                                                 covtype_sample,
+                                                                 covtype_test_tabnet.loc[covtype_sample.index],
+                                                                 covtype_tabnet_classifier,
+                                                                 ['Wilderness_Area', 'Soil_Type'],
+                                                                 n_jobs=10,
+                                                                 score_type='best')
+
+    print(f"acc_covtype_vime_best: {covtype_vime_best_accuracies}")
     # print(f"acc_covtype_vime_median: {covtype_vime_median_accuracies}")
     # print(f"acc_covtype_vime_worst: {covtype_vime_worst_accuracies}")
+
+    print(f"acc_covtype_tabnet_best: {covtype_tabnet_best_accuracies}")
 
     print(f"acc_spotify_tabnet_best: {spotify_tabnet_best_accuracies}")
     # print(f"acc_spotify_tabnet_median: {spotify_tabnet_median_accuracies}")

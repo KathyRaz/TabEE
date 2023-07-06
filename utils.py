@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import jensenshannon
-from scipy.stats import wasserstein_distance
 
 from constants import NUMERIC_TYPE, CATEGORICAL_TYPE, LIFT_SUFFIX
 

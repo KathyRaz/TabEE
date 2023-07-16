@@ -1,6 +1,7 @@
 import warnings
 from itertools import product
 from tqdm import tqdm
+
 warnings.filterwarnings("ignore")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,86 +10,76 @@ import umap.umap_ as umap
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.mixture import GaussianMixture
-
+import time
 from constants import DATA_TYPE, DIST, BINS, CATEGORICAL_TYPE, NUMERIC_TYPE, CLUSTER, BINNED_SUFFIX, PROBA_COL
-from utils import determine_column_type, equalObs, normalize_by_clusters_num, distributions_distance, \
-    distributions_lift, diversity_metric
+from utils import determine_column_type, normalize_by_clusters_num, distributions_distance, distributions_lift, \
+    diversity_metric, bin_single_column, best_from_list_by_order_type
 
 pd.set_option('mode.chained_assignment', None)
-
-
-def bin_single_column(binning_column, type, data_type, num_bins=10, bins=None):
-    # data_type = self.source_distributions[binning_column.name][DATA_TYPE]
-    # type must be one of 'source', 'result'
-    if data_type == CATEGORICAL_TYPE:
-        histogram = binning_column.value_counts(normalize=True).rename(f"{binning_column.name}_{type}")
-        bins = list(histogram.index)
-        return histogram, bins
-    elif data_type == NUMERIC_TYPE:
-        if bins is None and num_bins is not None:
-            bins = equalObs(binning_column, num_bins)
-        counts, bin_edges = np.histogram(binning_column, bins=bins)
-        counts = counts / sum(counts)
-        bin_edges[len(bin_edges) - 1] = bin_edges[len(bin_edges) - 1] + 1  # patch to solve pd.cut problem last bin
-        return pd.Series(counts, index=bin_edges[:-1], name=f"{binning_column.name}_{type}"), bins
-    else:
-        raise Exception("incorrect data type")
 
 
 class EmbeddingExplainer:
     # TODO assigning an explanation for a single example using the clustering model.
     # TODO exporting Clustering module
-    def __init__(self, dataset, embedding, n_clusters_range=range(2, 20, 1), random_state=None, sil_weight=1,
-                 suff_weight=1, interest_weight=1, diversity_weight=0.0, explanation_score_type='best'):
+    def __init__(self, dataset, embedding, n_clusters_range=range(2, 20, 1), random_state=None, sil_weight=0,
+                 suff_weight=1, interest_weight=1, diversity_weight=0.0, clustering_method='kmeans',
+                 explanation_score_type='best'):
         self.dataset = dataset.copy()
         self.embedding = embedding.copy()
-        self.source_distributions = dict()
-        self.n_clusters_range = list(n_clusters_range)
-        self.random_state = random_state if random_state is not None else int(np.random.randint(0, 1e8))
-        self.final_clustered_dataset = None
-        self.clustering_model = None
-        self.n_clusters = None
+        self.explanation_score_type = explanation_score_type
+        self.clustering_method = clustering_method
         self.sil_weight = sil_weight
         self.suff_weight = suff_weight
         self.interest_weight = interest_weight
         self.diversity_weight = diversity_weight
         self.total_weight = self.sil_weight + self.suff_weight + self.interest_weight + self.diversity_weight
         assert self.total_weight > 0.0
+        self.random_state = random_state if random_state is not None else int(np.random.randint(0, 1e8))
+        self.n_clusters_range = list(n_clusters_range)
+        self.source_distributions = dict()
+        self.final_clustered_dataset = None
+        self.clustering_model = None
+        self.n_clusters = None
         self.explanation_score = None
         self.embedding_explanation = None
         self.umap_representation = None
-        self.explanation_score_type = explanation_score_type
         self._bin_dataset_columns()
 
     def generate_and_plot_explanation(self, candidates_per_cluster=5):
         _ = self.choose_n_clusters_by_explanation(candidates_per_cluster=candidates_per_cluster)
         self.plot_explanation()
 
-    def choose_n_clusters_by_explanation(self, candidates_per_cluster=5):
+    def choose_n_clusters_by_explanation(self, candidates_per_cluster=5, eval_time=False):
         candidates_per_cluster = min(candidates_per_cluster, len(self.dataset.columns))
         sil_scores = np.array([])
         cluster_scores = np.array([])
         explanations = []
+        if eval_time:
+            start_time = time.time()
+            times_list = []
+            max_scores = []
         for n_clusters in tqdm(self.n_clusters_range, desc='evaluating number of clusters'):
-            clustered_dataset, _ = self.cluster_n_clusters(n_clusters, join_dataset_type='both')
+            clustered_dataset, _ = self.cluster_n_clusters(n_clusters, join_dataset_type='both',
+                                                           clustering_method=self.clustering_method)
             sil_score, mean_clusters_score, explanation = self.evaluate_clustered_dataset(clustered_dataset, n_clusters,
                                                                                           candidates_per_cluster=candidates_per_cluster)
             sil_scores = np.append(sil_scores, sil_score)
             cluster_scores = np.append(cluster_scores, mean_clusters_score)
             explanations.append(explanation)
+            if eval_time:
+                times_list.append(time.time() - start_time)
+                max_scores.append(np.max(cluster_scores))
             del clustered_dataset
-        if self.explanation_score_type == 'best':
-            argmax_scores = np.argmax(cluster_scores)
-        elif self.explanation_score_type == 'median':
-            argmax_scores = np.argsort(cluster_scores)[len(cluster_scores) // 2]
-        elif self.explanation_score_type == 'worst':
-            argmax_scores = np.argsort(cluster_scores)[0]
+        argmax_scores = best_from_list_by_order_type(cluster_scores, self.explanation_score_type)
         best_n = self.n_clusters_range[argmax_scores]
         self.n_clusters = best_n
         self.explanation_score = cluster_scores[argmax_scores]
         self.embedding_explanation = explanations[argmax_scores]
         self.final_clustered_dataset, self.clustering_model = self.cluster_n_clusters(best_n,
-                                                                                      join_dataset_type='dataset')
+                                                                                      join_dataset_type='dataset',
+                                                                                      clustering_method=self.clustering_method)
+        if eval_time:
+            return times_list, max_scores
         return self.final_clustered_dataset, self.n_clusters, self.explanation_score, self.embedding_explanation
 
     def plot_explanation(self):
@@ -110,7 +101,10 @@ class EmbeddingExplainer:
 
     def evaluate_clustered_dataset(self, clustered_dataset, n_clusters, candidates_per_cluster=5):
         # clustered_dataset should be of type original_dataset + embeddings + cluster column
-        sil_score = silhouette_score(clustered_dataset[self.embedding.columns], clustered_dataset[CLUSTER])
+        if self.sil_weight > 0:
+            sil_score = silhouette_score(clustered_dataset[self.embedding.columns], clustered_dataset[CLUSTER])
+        else:
+            sil_score = 0.0
         clusters_candidates_lists = []
         dataset_columns = list(self.dataset.columns) + [CLUSTER]
         for cluster_id in range(n_clusters):
@@ -149,12 +143,7 @@ class EmbeddingExplainer:
                                                          self.diversity_weight * combination_diversity)
             combinations_scores.append(combination_score)
 
-        if self.explanation_score_type == 'best':
-            argmax_score = np.argmax(combinations_scores)
-        elif self.explanation_score_type == 'median':
-            argmax_score = np.argsort(combinations_scores)[len(combinations_scores) // 2]
-        elif self.explanation_score_type == 'worst':
-            argmax_score = np.argsort(combinations_scores)[0]
+        argmax_score = best_from_list_by_order_type(combinations_scores, self.explanation_score_type)
         max_clusters_score = combinations_scores[argmax_score]
         best_combination = all_possible_combinations[argmax_score]
         best_explanation = [(clusters_candidates_lists[cluster_id][best_combination[cluster_id]][0],
@@ -176,9 +165,11 @@ class EmbeddingExplainer:
             clustered_dataset.loc[:, binned_explained_col] = clustered_dataset[explained_col]
             binned_proba_df = explained_lift.reset_index(name=PROBA_COL).rename(
                 columns={explained_col: binned_explained_col})
-        clustered_dataset = clustered_dataset.merge(binned_proba_df, on=binned_explained_col, how='left')
-        full_dataset_proba_sum = clustered_dataset[PROBA_COL].sum()
-        cluster_proba_sum = clustered_dataset[clustered_dataset[CLUSTER] == cluster_id][PROBA_COL].sum()
+        clustered_dataset_with_proba = clustered_dataset.merge(binned_proba_df, on=binned_explained_col, how='left')
+        clustered_dataset.drop(columns=[binned_explained_col], inplace=True)
+        full_dataset_proba_sum = clustered_dataset_with_proba[PROBA_COL].sum()
+        cluster_proba_sum = clustered_dataset_with_proba[clustered_dataset_with_proba[CLUSTER] == cluster_id][
+            PROBA_COL].sum()
         if cluster_proba_sum == 0:
             return 0.0
         return cluster_proba_sum / full_dataset_proba_sum
@@ -203,8 +194,6 @@ class EmbeddingExplainer:
         clustered_dataset = joined_dataset.join(clustered_dataset)
         return clustered_dataset, clustering_model
 
-    # TODO add to valid latex
-    # TODO cut max values in categorical depending on importance
     def _plot_explanation_from_dist(self, column_name, result_dist, cluster_id):
         source_dist = self.source_distributions[column_name][DIST]
         bins = self.source_distributions[column_name][BINS]
@@ -231,7 +220,8 @@ class EmbeddingExplainer:
         plt.ylabel("frequency (%)", fontsize=16)
 
         ax.set_title(
-            label=f"Cluster {cluster_id} Explanation\nThe column `{column_name}` is represented significantly differently in the cluster.\n",
+            label=f"Cluster {cluster_id} Explanation\nThe column `{column_name}` "
+                  f"is represented significantly differently in the cluster.\n",
             loc='center', wrap=True)
         fig = plt.gcf()
         return fig
@@ -263,7 +253,7 @@ class EmbeddingExplainer:
         top_candidates = sorted_indices[:num_candidates]
         top_columns = list(np.array(cluster_data.columns)[top_candidates])
         top_distances = list(np.array(columns_distances)[top_candidates])
-        top_distributions = list(np.array(columns_distributions, dtype='object')[top_candidates])
+        top_distributions = [columns_distributions[i] for i in top_candidates]
 
         top_sufficiencies = []
         for candidate_index in range(num_candidates):

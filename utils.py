@@ -6,14 +6,17 @@ from constants import NUMERIC_TYPE, CATEGORICAL_TYPE, LIFT_SUFFIX
 
 
 def calculate_distance(s, r, data_type=None):
-    s = np.array(s, dtype='float64')
-    s = s[s == s]
-    r = np.array(r, dtype='float64')
-    r = r[r == r]
+    s_np = np.array(s, dtype='float64')
+    s_np = s_np[s_np == s_np]
+    r_np = np.array(r, dtype='float64')
+    r_np = r_np[r_np == r_np]
     # if data_type == NUMERIC_TYPE:
     #     return 0 if len(r) == 0 else wasserstein_distance(r, s)
     # else:
-    return 0 if len(r) == 0 else jensenshannon(r, s)
+    try:
+        return 0 if len(r_np) == 0 else jensenshannon(r_np, s_np)
+    except Exception:
+        return
 
 
 def distributions_distance(source_dist, result_dist, data_type=None):
@@ -40,6 +43,8 @@ def equalObs(x, nbin):
 
 
 def distributions_lift(source_dist, result_dist):
+    # print(f"source:\\n {source_dist}")
+    # print(f"result:\\n {result_dist}")
     distributions_pd = pd.concat([source_dist, result_dist], axis=1).fillna(0.0)
     return distributions_pd[result_dist.name] / distributions_pd[source_dist.name]
 
@@ -67,3 +72,31 @@ def diversity_metric(col_names, col_distributions):
         else:  # TODO add permutation maximization for symmetry + scaling
             diversity += diversity_from_distributions(distributions)
     return diversity
+
+
+def bin_single_column(binning_column, type, data_type, num_bins=10, bins=None):
+    # data_type = self.source_distributions[binning_column.name][DATA_TYPE]
+    # type must be one of 'source', 'result'
+    if data_type == CATEGORICAL_TYPE:
+        histogram = binning_column.value_counts(normalize=True).rename(f"{binning_column.name}_{type}")
+        bins = list(histogram.index)
+        return histogram, bins
+    elif data_type == NUMERIC_TYPE:
+        if bins is None and num_bins is not None:
+            bins = equalObs(binning_column, num_bins)
+        counts, bin_edges = np.histogram(binning_column, bins=bins)
+        counts = counts / sum(counts)
+        bin_edges[len(bin_edges) - 1] = bin_edges[len(bin_edges) - 1] + 1  # patch to solve pd.cut problem last bin
+        return pd.Series(counts, index=bin_edges[:-1], name=f"{binning_column.name}_{type}"), bins
+    else:
+        raise Exception("incorrect data type")
+
+
+def best_from_list_by_order_type(lst, ordering_type):
+    assert ordering_type in ['best', 'worst', 'median']
+    if ordering_type == 'best':
+        return np.argmax(lst)
+    elif ordering_type == 'median':
+        return np.argsort(lst)[len(lst) // 2]
+    elif ordering_type == 'worst':
+        return np.argsort(lst)[0]

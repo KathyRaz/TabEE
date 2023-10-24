@@ -4,7 +4,7 @@ import sys, os
 
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 
-sys.path.insert(0, os.path.abspath('../..'))
+sys.path.insert(0, os.path.abspath('../../..'))
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import tabnet_embedding.main as tabnet_embedding
 import transtab_main.create_embeddings as transtab_embedding

@@ -1,5 +1,5 @@
 # TabEE - Tabular Embeddings Explanations
-The paper was published in SIGMOD24' and available <a href="[https://dl.acm.org/doi/abs/10.1145/3639329]">here</a>.
+The paper was published in SIGMOD24' and available [here](https://dl.acm.org/doi/abs/10.1145/3639329).
 
 ### Introduction
 
